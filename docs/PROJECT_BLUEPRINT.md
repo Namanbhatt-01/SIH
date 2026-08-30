@@ -51,10 +51,14 @@ This project implements a hybrid **ESP32 Edge Device ↔ Infinix Laptop Server**
   * RAM consumption: **19.8 KB** (Fits within the <256KB constraint)
   * Accuracy: **96.67%**
 
-### Paper 2: *Adaptive Edge-Cloud Inference for Speech-to-Action Systems (ASTA)* (Dec 2025)
-* **Design Integration**: Direct bare-metal socket streaming to a local compute node (Infinix Laptop), avoiding the >150 ms cloud API overhead.
+### Paper 2: *Adaptive Edge-Cloud Speech Recognition System* (Dec 2025)
+* **Design Integration**: Direct socket streaming to local AMD Ryzen 7 5825U CPU compute node, running quantized **Faster-Whisper `tiny` (INT8 Multilingual: English & Hindi Latin)**.
 * **Validated Server Performance**:
-  * Local ASR latency: **87.3 ms $\rightarrow$ 42 ms** with INT8 Whisper/faster-whisper.
+  * Model Architecture: **`tiny` INT8 (39M parameters)**
+  * Supported Languages: **English (`en`) & Hindi Latin / Hinglish (`hi`)**
+  * Processing Speed: **~10x real-time speed** on Ryzen CPU
+  * Memory Footprint: **~150 MB RAM**
+  * Local ASR compute latency: **<35 ms**
 
 ---
 

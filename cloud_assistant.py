@@ -61,10 +61,10 @@ audio_buffer = np.zeros(TARGET_SAMPLES, dtype=np.float32)
 # 2. Load Local Faster-Whisper ASR Engine (INT8 Multilingual: Hindi & English)
 # ---------------------------------------------------------------------------
 print("🚀 [2/2] Loading Offline Faster-Whisper ASR Engine (Hindi + English)...")
-# 'base' or 'small' multilingual model for fast INT8 CPU inference
-WHISPER_MODEL_SIZE = "base"
+# Fast multilingual 'tiny' model for English and Hindi (Latin/Hinglish) INT8 CPU inference
+WHISPER_MODEL_SIZE = "tiny"
 whisper_engine = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=4)
-print(f"✅ Offline ASR Engine Ready: Faster-Whisper '{WHISPER_MODEL_SIZE}' (INT8 Quantized)")
+print(f"✅ Offline ASR Engine Ready: Faster-Whisper '{WHISPER_MODEL_SIZE}' (INT8 Quantized, English & Hindi Latin Supported)")
 print("=" * 60)
 
 def extract_features(audio: np.ndarray) -> np.ndarray:

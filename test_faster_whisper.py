@@ -23,9 +23,9 @@ def benchmark_faster_whisper():
     print("🧪 FASTER-WHISPER MULTILINGUAL (HINDI & ENGLISH) BENCHMARK")
     print("=" * 65)
 
-    print("\n[1/3] Initializing Faster-Whisper 'base' Multilingual Model (INT8 CPU)...")
+    print("\n[1/3] Initializing Faster-Whisper 'tiny' Multilingual Model (English & Hindi Latin)...")
     t0 = time.perf_counter()
-    model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=4)
+    model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
     t1 = time.perf_counter()
     print(f"✅ Model Loaded in {(t1 - t0)*1000:.2f} ms")
 
@@ -36,17 +36,19 @@ def benchmark_faster_whisper():
     audio_signal = (np.sin(2 * np.pi * 440 * t) * 0.5).astype(np.float32)
 
     print("\n[2/3] Benchmarking Inference Latency on 2.0-Second Audio Chunk...")
-    t_start = time.perf_counter()
+    t2 = time.perf_counter()
     segments, info = model.transcribe(
         audio_signal,
         beam_size=1,
         best_of=1,
-        language="hi"  # Hindi mode test
+        condition_on_previous_text=False,
+        temperature=0.0,
+        vad_filter=False
     )
-    list(segments)  # Consume generator
-    t_end = time.perf_counter()
+    _ = list(segments)
+    t3 = time.perf_counter()
 
-    latency_ms = (t_end - t_start) * 1000
+    latency_ms = (t3 - t2) * 1000
     realtime_factor = latency_ms / (duration_sec * 1000)
 
     print("\n[3/3] Benchmark Results:")

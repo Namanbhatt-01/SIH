@@ -45,9 +45,10 @@ except ImportError:
 # Configuration
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 TCP_SERVER_PORT = 8088
-WHISPER_MODEL_NAME = "small"
+WHISPER_MODEL_NAME = "tiny"
 COMPUTE_TYPE = "int8"
 CPU_THREADS = 4
+BEAM_SIZE = 1
 
 if os.path.exists(CONFIG_PATH):
     try:
@@ -87,11 +88,29 @@ stats = {
 request_history = []
 lock = threading.Lock()
 
+# Protocol Opcodes
+PROTOCOL_HEARTBEAT = 0x00
+PROTOCOL_SYN = 0x01
+PROTOCOL_SYN_ACK = 0x06
+PROTOCOL_AUDIO_CHUNK = 0x02
+PROTOCOL_STREAM_END = 0xFF
+PROTOCOL_TRANSIT_ACK = 0x7F
+
 # Load Whisper Model
 whisper_engine = None
 if HAS_FASTER_WHISPER:
     try:
         whisper_engine = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
+        # Dummy Warm-Up Inference (Eliminates Cold Start Latency Spike)
+        dummy_audio = np.zeros(16000, dtype=np.float32)
+        _ = whisper_engine.transcribe(
+            dummy_audio,
+            beam_size=1,
+            best_of=1,
+            condition_on_previous_text=False,
+            temperature=0.0,
+            vad_filter=False
+        )
     except Exception:
         whisper_engine = None
 
@@ -108,127 +127,151 @@ def get_local_ips():
 
 def handle_client(client_sock, client_addr):
     client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    client_sock.settimeout(12.0)
+    client_sock.settimeout(60.0) # Persistent pre-warmed idle connection timeout
     is_protocol = False
 
     try:
-        first_byte = client_sock.recv(1)
-        if not first_byte:
-            client_sock.close()
-            return
-
         pcm_chunks = []
-        if first_byte[0] == PROTOCOL_SYN:
-            is_protocol = True
-            client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
-        else:
-            pcm_chunks.append(first_byte)
 
         while True:
             try:
-                chunk = client_sock.recv(1024)
-                if not chunk:
-                    break
-
-                if is_protocol:
-                    if chunk == bytes([PROTOCOL_STREAM_END]):
-                        client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        break
-                    elif len(chunk) > 1 and chunk[-1] == PROTOCOL_STREAM_END:
-                        pcm_chunks.append(chunk[:-1])
-                        client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
-                        break
-
-                pcm_chunks.append(chunk)
+                opcode_byte = client_sock.recv(1)
             except socket.timeout:
                 break
             except Exception:
                 break
 
-        raw_bytes = b"".join(pcm_chunks)
-        audio_dur_ms = int(len(raw_bytes) / 32)
+            if not opcode_byte:
+                break
 
-        t_asr_start = time.perf_counter()
-        transcribed_text = ""
-        detected_lang = "en"
+            opcode = opcode_byte[0]
 
-        if len(raw_bytes) > 0:
-            audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            
-            # Noise floor check & smart peak normalization
-            max_peak = np.max(np.abs(audio_np))
-            if max_peak > 0.008:
-                audio_np = audio_np / max_peak
+            if opcode == PROTOCOL_HEARTBEAT:
+                # Idle TCP Keepalive Ping
+                continue
 
-            if max_peak < 0.003:
-                # Silence / noise floor below mic signal
+            if opcode == PROTOCOL_SYN:
+                is_protocol = True
+                client_sock.sendall(bytes([PROTOCOL_SYN_ACK]))
+                continue
+
+            elif opcode == PROTOCOL_AUDIO_CHUNK:
+                # Length-Prefixed TLV Frame: Read 2-byte N (payload length)
+                len_bytes = client_sock.recv(2)
+                if len(len_bytes) < 2:
+                    break
+                payload_len = struct.unpack("<H", len_bytes)[0]
+
+                chunk_data = b""
+                while len(chunk_data) < payload_len:
+                    more = client_sock.recv(payload_len - len(chunk_data))
+                    if not more:
+                        break
+                    chunk_data += more
+
+                pcm_chunks.append(chunk_data)
+
+            elif opcode == PROTOCOL_STREAM_END:
+                len_bytes = client_sock.recv(2) # Consume 2-byte length if present
+                client_sock.sendall(bytes([PROTOCOL_TRANSIT_ACK]))
+
+                raw_bytes = b"".join(pcm_chunks)
+                audio_dur_ms = int(len(raw_bytes) / 32)
+
+                t_asr_start = time.perf_counter()
                 transcribed_text = ""
                 detected_lang = "en"
-            elif whisper_engine:
-                segments, info = whisper_engine.transcribe(
-                    audio_np,
-                    beam_size=BEAM_SIZE,
-                    best_of=BEAM_SIZE,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=400),
-                    initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste."
-                )
-                detected_lang = getattr(info, 'language', 'en')
 
-                # Enforce Hindi & English ONLY constraint (drop/fallback foreign misdetections like TR, AR)
-                if detected_lang not in ["en", "hi"]:
-                    segments, info = whisper_engine.transcribe(
-                        audio_np,
-                        beam_size=1,
-                        language="en",
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=400),
-                        initial_prompt="Hindi and English smart assistant commands: turn on light, fan, switch."
-                    )
-                    detected_lang = "en"
+                if len(raw_bytes) > 0:
+                    audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-                transcribed_text = " ".join([seg.text for seg in segments]).strip()
+                    max_peak = np.max(np.abs(audio_np))
+                    if max_peak > 0.008:
+                        audio_np = audio_np / max_peak
+
+                    if max_peak < 0.003:
+                        transcribed_text = ""
+                        detected_lang = "en"
+                    elif whisper_engine:
+                        segments, info = whisper_engine.transcribe(
+                            audio_np,
+                            beam_size=BEAM_SIZE,
+                            best_of=BEAM_SIZE,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400),
+                            initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti, chalao, band karo, namaste, kaise ho."
+                        )
+                        detected_lang = getattr(info, 'language', 'en')
+
+                        if detected_lang not in ["en", "hi"]:
+                            segments, info = whisper_engine.transcribe(
+                                audio_np,
+                                beam_size=1,
+                                language="en",
+                                vad_filter=True,
+                                vad_parameters=dict(min_silence_duration_ms=400),
+                                initial_prompt="English and Hindi (Latin/Hinglish) smart assistant voice commands: turn on light, fan, switch, pankha, batti."
+                            )
+                            detected_lang = "en"
+
+                        transcribed_text = " ".join([seg.text for seg in segments]).strip()
+                    else:
+                        time.sleep(0.042)
+                        transcribed_text = "Sample audio stream"
+
+                t_asr_end = time.perf_counter()
+                asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
+
+                # Send 18-Byte Telemetry Header + UTF-8 Transcribed Text Payload back to ESP32 OLED
+                text_bytes = transcribed_text.encode('utf-8')
+                text_len = len(text_bytes)
+                if is_protocol:
+                    try:
+                        telemetry_payload = struct.pack(f"<IIIIH{text_len}s", audio_dur_ms, 0, 0, asr_compute_ms, text_len, text_bytes)
+                        client_sock.sendall(telemetry_payload)
+                    except Exception:
+                        pass
+
+                timestamp = time.strftime("%H:%M:%S")
+                lang_label = "Hindi (hi)" if detected_lang == "hi" else ("English (en)" if detected_lang == "en" else detected_lang.upper())
+
+                with lock:
+                    stats["total_requests"] += 1
+                    stats["last_client_ip"] = client_addr[0]
+                    stats["last_lang"] = lang_label
+                    stats["last_text"] = transcribed_text if transcribed_text else "(empty)"
+                    stats["last_duration_ms"] = audio_dur_ms
+                    stats["last_latency_ms"] = asr_compute_ms
+
+                    request_history.insert(0, {
+                        "time": timestamp,
+                        "ip": client_addr[0],
+                        "lang": lang_label,
+                        "dur_ms": audio_dur_ms,
+                        "asr_ms": asr_compute_ms,
+                        "text": transcribed_text if transcribed_text else "(empty)"
+                    })
+                    if len(request_history) > 10:
+                        request_history.pop()
+
+                pcm_chunks = []
+
             else:
-                time.sleep(0.042)
-                transcribed_text = "Sample audio stream"
-
-        # ASTA Engine Processing
-        try:
-            from asta_engine import ASTACommandValidator, MetricsCollector
-            HAS_ASTA = True
-        except ImportError:
-            HAS_ASTA = False
-
-        t_asr_end = time.perf_counter()
-        asr_compute_ms = int((t_asr_end - t_asr_start) * 1000)
-
-        if HAS_ASTA:
-            metrics = MetricsCollector.get_metrics(asr_latency_ms=asr_compute_ms, audio_dur_ms=audio_dur_ms)
-            asta_res = ASTACommandValidator.validate_and_repair(transcribed_text)
-        else:
-            metrics = {"cpu_workload_pct": 0.0}
-            asta_res = {"valid": False, "repaired_command": None, "was_repaired": False}
-
-        if is_protocol:
-            try:
-                telemetry_payload = struct.pack("<IIII", audio_dur_ms, 0, 0, asr_compute_ms)
-                client_sock.sendall(telemetry_payload)
-            except Exception:
-                pass
+                raw_data = client_sock.recv(1024)
+                if not raw_data:
+                    break
+                pcm_chunks.append(raw_data)
 
         timestamp = time.strftime("%H:%M:%S")
         lang_label = "Hindi (hi)" if detected_lang == "hi" else ("English (en)" if detected_lang == "en" else detected_lang.upper())
-        repaired_cmd = asta_res["repaired_command"] if asta_res["valid"] else "-"
 
         with lock:
             stats["total_requests"] += 1
             stats["last_client_ip"] = client_addr[0]
             stats["last_lang"] = lang_label
             stats["last_text"] = transcribed_text if transcribed_text else "(empty)"
-            stats["last_cmd"] = repaired_cmd
             stats["last_duration_ms"] = audio_dur_ms
             stats["last_latency_ms"] = asr_compute_ms
-            stats["cpu_pct"] = metrics["cpu_workload_pct"]
 
             request_history.insert(0, {
                 "time": timestamp,
@@ -236,8 +279,6 @@ def handle_client(client_sock, client_addr):
                 "lang": lang_label,
                 "dur_ms": audio_dur_ms,
                 "asr_ms": asr_compute_ms,
-                "cpu_pct": metrics["cpu_workload_pct"],
-                "action": repaired_cmd,
                 "text": transcribed_text if transcribed_text else "(empty)"
             })
             if len(request_history) > 10:
@@ -269,10 +310,6 @@ def generate_dashboard():
     status_text.append("Total Requests : ", style=TEXT_SUBDUED)
     status_text.append(f"{stats['total_requests']}\n", style=TEXT_PRIMARY)
     
-    status_text.append("System Load    : ", style=TEXT_SUBDUED)
-    cpu_val_style = ALERT_RUST if stats['cpu_pct'] > 80.0 else TEXT_PRIMARY
-    status_text.append(f"{stats['cpu_pct']:.1f}%\n", style=cpu_val_style)
-    
     status_text.append("ASR Engine     : ", style=TEXT_SUBDUED)
     status_text.append(f"Faster-Whisper '{WHISPER_MODEL_NAME}' (INT8 CPU)", style=TEXT_PRIMARY)
 
@@ -299,9 +336,6 @@ def generate_dashboard():
     metrics_text.append("ASR Compute    : ", style=TEXT_SUBDUED)
     latency_style = ALERT_RUST if stats['last_latency_ms'] > 1000 else TEXT_PRIMARY
     metrics_text.append(f"{stats['last_latency_ms']} ms\n\n", style=latency_style)
-    
-    metrics_text.append("ASTA Action    : ", style=TEXT_SUBDUED)
-    metrics_text.append(f"{stats['last_cmd']}\n", style=f"bold {TEXT_PRIMARY}")
     
     metrics_text.append("Speech Output  : ", style=TEXT_SUBDUED)
     metrics_text.append(f"\"{stats['last_text']}\"", style=TEXT_PRIMARY)
@@ -330,7 +364,6 @@ def generate_dashboard():
     table.add_column("Language", justify="left", style=TEXT_PRIMARY, width=14)
     table.add_column("Duration", justify="right", style=TEXT_PRIMARY, width=10)
     table.add_column("ASR Latency", justify="right", width=12)
-    table.add_column("ASTA Action", justify="left", style=TEXT_PRIMARY, width=22)
     table.add_column("Transcribed Text", justify="left", style=TEXT_PRIMARY, no_wrap=True, overflow="ellipsis")
 
     with lock:
@@ -344,7 +377,6 @@ def generate_dashboard():
                 req["lang"],
                 f"{req['dur_ms']} ms",
                 lat_text,
-                req["action"],
                 req["text"]
             )
 
